@@ -1,12 +1,13 @@
 import json
 import traceback
+import copy
 from logging import Handler, CRITICAL, ERROR, WARNING, INFO, FATAL, DEBUG, NOTSET, Formatter
 
 import six
 import slacker
 
-ERROR_COLOR = 'danger'  # color name is built in to Slack API
-WARNING_COLOR = 'warning'  # color name is built in to Slack API
+ERROR_COLOR = 'danger'
+WARNING_COLOR = 'warning'
 INFO_COLOR = '#439FE0'
 
 COLORS = {
@@ -23,23 +24,8 @@ DEFAULT_EMOJI = ':heavy_exclamation_mark:'
 
 
 class NoStacktraceFormatter(Formatter):
-    """
-    By default the stacktrace will be formatted as part of the message.
-    Since we want the stacktrace to be in the attachment of the Slack message,
-     we need a custom formatter to leave it out of the message
-    """
-
     def formatException(self, ei):
         return None
-
-    def format(self, record):
-        # Work-around for https://bugs.python.org/issue29056
-        saved_exc_text = record.exc_text
-        record.exc_text = None
-        try:
-            return super(NoStacktraceFormatter, self).format(record)
-        finally:
-            record.exc_text = saved_exc_text
 
 
 class SlackerLogHandler(Handler):
@@ -47,48 +33,31 @@ class SlackerLogHandler(Handler):
                  fail_silent=False, ping_users=None, ping_level=None):
         Handler.__init__(self)
         self.formatter = NoStacktraceFormatter()
-
         self.stack_trace = stack_trace
         self.fail_silent = fail_silent
-
         self.slacker = slacker.Slacker(api_key)
-
         self.username = username
         self.icon_url = icon_url
         self.icon_emoji = icon_emoji if (icon_emoji or icon_url) else DEFAULT_EMOJI
-        self.channel = channel
-        if not self.channel.startswith('#') and not self.channel.startswith('@'):
-            self.channel = '#' + self.channel
-
+        self.channel = channel if channel.startswith('#') or channel.startswith('@') else '#' + channel
         self.ping_level = ping_level
         self.ping_users = []
 
-        if ping_users:
-            user_list = self.slacker.users.list().body['members']
-
-            for ping_user in ping_users:
-                ping_user = ping_user.lstrip('@')
-
-                for user in user_list:
-                    if user['name'] == ping_user:
-                        self.ping_users.append(user['id'])
-                        break
-                else:
-                    raise RuntimeError('User not found in Slack users list: %s' % ping_user)
-
-
-
     def build_msg(self, record):
-        return six.text_type(self.format(record))
+        clean_record = copy.copy(record)
+        clean_record.exc_info = None
+        clean_record.exc_text = None
+        clean_record.stack_info = None
+        return six.text_type(self.format(clean_record))
 
     def build_trace(self, record, fallback):
         trace = {
             'fallback': fallback,
-            'color': COLORS.get(self.level, INFO_COLOR)
+            'color': COLORS.get(record.levelno, INFO_COLOR)
         }
 
         if record.exc_info:
-            trace['text'] = '\n'.join(traceback.format_exception(*record.exc_info))
+            trace['text'] = ''.join(traceback.format_exception(*record.exc_info))
 
         return trace
 
@@ -99,23 +68,26 @@ class SlackerLogHandler(Handler):
             for user in self.ping_users:
                 message = '<@%s> %s' % (user, message)
 
-        if self.stack_trace:
-            trace = self.build_trace(record, fallback=message)
-            attachments = json.dumps([trace])
-        else:
-            attachments = None
+        # 1) Post the main message
+        resp = self.slacker.chat.post_message(
+            channel=self.channel,
+            text=message,
+            username=self.username,
+            icon_url=self.icon_url,
+            icon_emoji=self.icon_emoji,
+        )
 
-        try:
+        # 2) If there is a traceback, reply in a thread
+        if self.stack_trace and record.exc_info:
+            trace_text = ''.join(traceback.format_exception(*record.exc_info))
+
+            parent_ts = resp.body['ts']  # Slacker response body contains Slack API ts
+
             self.slacker.chat.post_message(
-                text=message,
                 channel=self.channel,
+                text="```%s```" % trace_text,
                 username=self.username,
                 icon_url=self.icon_url,
-                icon_emoji=self.icon_emoji,
-                attachments=attachments,
+                icon_emoji=":bug:",
+                thread_ts=parent_ts,
             )
-        except slacker.Error as e:
-            if self.fail_silent:
-                pass
-            else:
-                raise e
